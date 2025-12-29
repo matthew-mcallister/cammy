@@ -341,7 +341,8 @@ fn main() {
     let solutions = solve::<15, 5>(100);
     let duration = start.elapsed().as_secs_f64();
 
-    println!("visited {} states in {:.2}s", solutions.states[0].len(), duration);
+    let num_states = solutions.states.iter().map(|v| v.len()).sum::<usize>();
+    println!("visited {} states in {:.2}s", num_states, duration);
     println!("bananas sold: {}", solutions.bananas_sold);
 
     if let Some(state) = solutions.solutions.first() {
