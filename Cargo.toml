@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 fnv = "1.0.7"
+num_cpus = "1.17.0"
