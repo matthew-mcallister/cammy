@@ -3,8 +3,6 @@
 //! traveled. She can carry at most C bananas at a time, but she can leave
 //! banana piles anywhere she likes on the road and pick them up later. How
 //! many bananas can she sell?
-//!
-//! We solve this problem using parallel map-reduce.
 
 #![feature(iter_macro, yield_expr)]
 
@@ -86,7 +84,6 @@ impl<const D: usize> State<D> {
     }
 }
 
-#[derive(Debug)]
 struct WorkerShared<const D: usize> {
     num_workers: u64,
     states: DashMap<StateKey<D>, StateMeta<D>>,
@@ -140,7 +137,6 @@ impl<const D: usize> Answer<D> {
     }
 }
 
-#[derive(Debug)]
 struct Worker<const D: usize> {
     shared: Arc<WorkerShared<D>>,
     senders: Vec<Sender<Work<D>>>,
@@ -174,8 +170,8 @@ impl<const D: usize> Worker<D> {
     fn run<const C: u16>(self, depth: u64, mut work: Vec<Work<D>>) {
         let mut worker = self;
         for level in 0..depth {
-            // Do not send any successors until all successors from previous
-            // level have been received
+            // Do not send any work until all work from previous
+            // level has been received
             worker.shared.synchronize(level);
 
             // Compute successors, sharded on hash
@@ -256,14 +252,19 @@ fn solve<const D: usize, const C: u16>(bananas: u16) -> (DashMap<StateKey<D>, St
     initial_state.inner.piles[0] = bananas - held;
     workers[0].shared.states.insert(initial_state.inner, StateMeta { prev: None, held });
 
+    let mut threads = vec![];
     for (i, worker) in workers.into_iter().enumerate() {
         let mut work = vec![];
         if i == 0 {
             work.push(vec![initial_state]);
         }
-        std::thread::spawn(move || {
+        threads.push(std::thread::spawn(move || {
             worker.run::<C>(depth as u64, work);
-        });
+        }));
+    }
+
+    for handle in threads {
+        handle.join().unwrap();
     }
 
     let mut answer = Answer::default();
@@ -271,14 +272,16 @@ fn solve<const D: usize, const C: u16>(bananas: u16) -> (DashMap<StateKey<D>, St
         answer.extend(a);
     }
 
-    let states = Arc::try_unwrap(shared).unwrap().states;
+    let Ok(shared) = Arc::try_unwrap(shared) else {
+        panic!("Arc::unwrap failed");
+    };
 
-    (states, answer)
+    (shared.states, answer)
 }
 
 fn main() {
     let start = std::time::Instant::now();
-    let (states, solutions) = solve::<15, 5>(140);
+    let (states, solutions) = solve::<10, 5>(170);
     let duration = start.elapsed().as_secs_f64();
 
     let num_states = states.len();
@@ -288,6 +291,8 @@ fn main() {
     if let Some(state) = solutions.solutions.first() {
         println!("{:?}", state);
     } else {
-        println!("no solutions found.");
+        let farthest = states.iter().max_by_key(|r| r.key().x).unwrap();
+        println!("no solutions found. farthest reached: {}", farthest.key().x);
+        println!("{:?}, {:?}", farthest.key(), farthest.value());
     }
 }
