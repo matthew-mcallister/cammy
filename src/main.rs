@@ -8,15 +8,13 @@
 
 #![feature(iter_macro, yield_expr)]
 
-use std::borrow::Borrow;
-use std::collections::hash_map::Entry;
 use std::hash::{BuildHasher, Hash};
 use std::iter::iter;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use fnv::{FnvBuildHasher, FnvHashMap};
+use dashmap::{DashMap, Entry};
+use fnv::FnvBuildHasher;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 struct StateKey<const D: usize> {
@@ -89,53 +87,76 @@ impl<const D: usize> State<D> {
 }
 
 #[derive(Debug)]
-struct WorkerShared {
+struct WorkerShared<const D: usize> {
     num_workers: u64,
+    states: DashMap<StateKey<D>, StateMeta<D>>,
     progress: Mutex<u64>,
     cond_var: Condvar,
     build_hasher: FnvBuildHasher,
-    stop_votes: AtomicU64,
-    cleanup: AtomicU64,
 }
 
-impl WorkerShared {
-    fn synchronize(&self, round: u64) {
+impl<const D: usize> WorkerShared<D> {
+    fn synchronize(&self, level: u64) {
         let mut progress = self.progress.lock().unwrap();
         *progress += 1;
-        let target = (round + 1) * self.num_workers;
+        let target = (level + 1) * self.num_workers;
         if *progress < target {
             while *progress < target {
                 progress = self.cond_var.wait(progress).unwrap();
             }
         } else {
-            // At this point, every other thread has aquired the mutex at least
-            // once, so it is guaranteed that every vote is visible at this
-            // point.
-            if self.stop_votes.load(Ordering::Relaxed) != self.num_workers {
-                self.stop_votes.store(0, Ordering::Relaxed);
-            }
             self.cond_var.notify_all();
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct States<const D: usize> {
-    // Thought: Could prune states where bananas on ground > current total bananas,
-    // since we can never revisit that state key
-    inner: FnvHashMap<StateKey<D>, StateMeta<D>>,
+type Work<const D: usize> = Vec<State<D>>;
+
+#[derive(Debug, Default)]
+struct Answer<const D: usize> {
     bananas_sold: u16,
-    solutions: Vec<StateKey<D>>,
+    solutions: Vec<State<D>>,
 }
 
-impl<const D: usize> States<D> {
+impl<const D: usize> Answer<D> {
+    fn insert(&mut self, state: &State<D>) {
+        if state.inner.x == (D - 1) as u16 {
+            if state.held > self.bananas_sold {
+                self.bananas_sold = state.held;
+                self.solutions.clear();
+                self.solutions.push(*state);
+            } else if state.held == self.bananas_sold {
+                self.solutions.push(*state);
+            }
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        if other.bananas_sold > self.bananas_sold {
+            *self = other;
+        } else if other.bananas_sold == self.bananas_sold {
+            self.solutions.extend(other.solutions);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Worker<const D: usize> {
+    shared: Arc<WorkerShared<D>>,
+    senders: Vec<Sender<Work<D>>>,
+    receiver: Receiver<Work<D>>,
+    answer: Answer<D>,
+    answer_sender: Sender<Answer<D>>,
+}
+
+impl<const D: usize> Worker<D> {
     fn insert(&mut self, prev: Option<State<D>>, state: State<D>) -> bool {
         let key = state.inner;
         let meta = StateMeta {
             prev,
             held: state.held,
         };
-        let inserted = match self.inner.entry(key) {
+        match self.shared.states.entry(key) {
             Entry::Occupied(e) => {
                 // Because we traverse in BF order, we always visit states with
                 // highest held value first
@@ -144,154 +165,62 @@ impl<const D: usize> States<D> {
             }
             Entry::Vacant(e) => {
                 e.insert(meta);
+                self.answer.insert(&state);
                 true
             }
-        };
-        if state.inner.x == (D - 1) as u16 {
-            if state.held > self.bananas_sold {
-                self.bananas_sold = state.held;
-                self.solutions.clear();
-                self.solutions.push(key);
-            } else if state.held == self.bananas_sold {
-                self.solutions.push(key);
-            }
         }
-        inserted
-    }
-}
-
-// Rehashing the entire state space could increase runtime by a constant
-// factor, so instead maintain the solution set in its sharded form
-#[derive(Clone, Debug, Default)]
-struct StateSet<const D: usize> {
-    build_hasher: FnvBuildHasher,
-    states: Vec<FnvHashMap<StateKey<D>, StateMeta<D>>>,
-    bananas_sold: u16,
-    solutions: Vec<StateKey<D>>,
-}
-
-impl<const D: usize> StateSet<D> {
-    fn new(states: impl Iterator<Item = States<D>>) -> Self {
-        let mut set = StateSet {
-            build_hasher: FnvBuildHasher::default(),
-            states: vec![],
-            bananas_sold: 0,
-            solutions: vec![],
-        };
-        for state in states {
-            set.states.push(state.inner);
-            if state.bananas_sold > set.bananas_sold {
-                set.bananas_sold = state.bananas_sold;
-                set.solutions.clear();
-                set.solutions.extend(state.solutions);
-            } else if state.bananas_sold == set.bananas_sold {
-                set.solutions.extend(state.solutions);
-            }
-        }
-        set
     }
 
-    #[allow(dead_code)]
-    fn get<'a>(&'a self, key: impl Borrow<StateKey<D>>) -> Option<&'a StateMeta<D>> {
-        let hash = self.build_hasher.hash_one(key.borrow());
-        let shard = (hash % (self.states.len() as u64)) as usize;
-        self.states[shard].get(key.borrow())
-    }
-}
-
-type Successors<const D: usize> = Vec<(State<D>, State<D>)>;
-
-#[derive(Debug)]
-struct Worker<const D: usize> {
-    shared: Arc<WorkerShared>,
-    senders: Vec<Sender<Successors<D>>>,
-    receiver: Receiver<Successors<D>>,
-    answer_sender: Sender<States<D>>,
-}
-
-impl<const D: usize> Worker<D> {
-    fn run<const C: u16>(self, mut states: States<D>) {
-        let worker = self;
-        let mut next: Vec<_> = states.inner.iter()
-            .map(|(&s, n)| State { inner: s, held: n.held })
-            .collect();
-        let mut round = 0;
-        let debug = std::env::var("DEBUG").is_ok();
-        loop {
-            if next.is_empty() {
-                worker.shared.stop_votes.fetch_add(1, Ordering::Relaxed);
-            }
-
+    fn run<const C: u16>(self, depth: u64, mut work: Vec<Work<D>>) {
+        let mut worker = self;
+        for level in 0..depth {
             // Do not send any successors until all successors from previous
-            // round have been received
-            worker.shared.synchronize(round);
-
-            if worker.shared.stop_votes.load(Ordering::Relaxed) >= worker.shared.num_workers {
-                // All workers are done
-                worker.answer_sender.send(states).unwrap();
-
-                if worker.shared.cleanup.fetch_add(1, Ordering::Relaxed) + 1
-                    >= worker.shared.num_workers
-                {
-                    println!("finished after {} rounds", round);
-                }
-
-                break;
-            }
+            // level have been received
+            worker.shared.synchronize(level);
 
             // Compute successors, sharded on hash
-            let mut successors: Vec<Vec<(State<D>, State<D>)>>
-                = vec![vec![]; worker.shared.num_workers as usize];
-            for state in std::mem::take(&mut next) {
+            let mut new_work: Vec<Work<D>> = vec![vec![]; worker.shared.num_workers as usize];
+            for state in std::mem::take(&mut work).into_iter().flat_map(|v| v.into_iter()) {
                 for successor in state.successors::<C>() {
-                    let hash = worker.shared.build_hasher.hash_one(&successor);
-                    let shard = (hash % worker.shared.num_workers) as usize;
-                    successors[shard].push((state, successor));
-                }
-            }
-
-            if debug && let Some(s) = successors[0].first() {
-                println!(
-                    "tid: {:?}, round: {}, successor: {:?}",
-                    std::thread::current().id(),
-                    round,
-                    s,
-                );
-            }
-
-            // Send successors to workers
-            for (i, succ) in successors.into_iter().enumerate() {
-                worker.senders[i].send(succ).unwrap();
-            }
-
-            // Receive and insert successors
-            for _ in 0..worker.shared.num_workers {
-                let succ = worker.receiver.recv().unwrap();
-                for (prev, state) in succ {
-                    if states.insert(Some(prev), state) {
-                        next.push(state);
+                    if worker.insert(Some(state), successor) {
+                        // We only use hashing to distribute work; the hash
+                        // here is not expected to match the hash used by the
+                        // state map
+                        let hash = worker.shared.build_hasher.hash_one(&successor);
+                        let shard = (hash % worker.shared.num_workers) as usize;
+                        new_work[shard].push(successor);
                     }
                 }
             }
 
-            round += 1;
+            // Distribute work
+            for (i, w) in new_work.into_iter().enumerate() {
+                worker.senders[i].send(w).unwrap();
+            }
+
+            // Receive work
+            for _ in 0..worker.shared.num_workers {
+                work.push(worker.receiver.recv().unwrap());
+            }
         }
+        
+        assert_eq!(work.iter().map(|v| v.len()).sum::<usize>(), 0);
+        worker.answer_sender.send(worker.answer).unwrap();
     }
 }
 
-fn build_workers<const D: usize>() -> (Vec<Worker<D>>, Receiver<States<D>>) {
+fn build_workers<const D: usize>() -> (Vec<Worker<D>>, Receiver<Answer<D>>) {
     let num_workers = num_cpus::get() as u64 - 1;
     let shared = Arc::new(WorkerShared {
         num_workers,
+        states: Default::default(),
         progress: Mutex::new(0),
         cond_var: Condvar::new(),
         build_hasher: FnvBuildHasher::default(),
-        stop_votes: AtomicU64::new(0),
-        cleanup: AtomicU64::new(0),
     });
-    let (answer_sender, answer_receiver) = channel::<States<D>>();
+    let (answer_sender, answer_receiver) = channel::<Answer<D>>();
 
-    let channels: Vec<_> = (0..num_workers).map(|_| channel::<Successors<D>>()).collect();
+    let channels: Vec<_> = (0..num_workers).map(|_| channel::<Work<D>>()).collect();
     let senders: Vec<Vec<_>> = (0..num_workers)
         .map(|_| channels.iter().map(|(s, _)| s.clone()).collect())
         .collect();
@@ -302,15 +231,19 @@ fn build_workers<const D: usize>() -> (Vec<Worker<D>>, Receiver<States<D>>) {
             senders,
             receiver,
             answer_sender: answer_sender.clone(),
+            answer: Default::default(),
         })
         .collect();
 
     (workers, answer_receiver)
 }
 
-fn solve<const D: usize, const C: u16>(bananas: u16) -> StateSet<D> {
+fn solve<const D: usize, const C: u16>(bananas: u16) -> (DashMap<StateKey<D>, StateMeta<D>>, Answer<D>) {
+    let depth = bananas + 1;
+
     let (workers, receiver) = build_workers::<D>();
     let num_workers = workers.len() as u64;
+    let shared = Arc::clone(&workers[0].shared);
 
     let held = std::cmp::min(bananas, C);
     let mut initial_state = State {
@@ -321,27 +254,34 @@ fn solve<const D: usize, const C: u16>(bananas: u16) -> StateSet<D> {
         held,
     };
     initial_state.inner.piles[0] = bananas - held;
+    workers[0].shared.states.insert(initial_state.inner, StateMeta { prev: None, held });
 
     for (i, worker) in workers.into_iter().enumerate() {
-        let mut states = States::<D>::default();
+        let mut work = vec![];
         if i == 0 {
-            states.insert(None, initial_state);
+            work.push(vec![initial_state]);
         }
         std::thread::spawn(move || {
-            worker.run::<C>(states);
+            worker.run::<C>(depth as u64, work);
         });
     }
 
-    let states = (0..num_workers).map(|_| receiver.recv().unwrap());
-    StateSet::new(states)
+    let mut answer = Answer::default();
+    for a in (0..num_workers).map(|_| receiver.recv().unwrap()) {
+        answer.extend(a);
+    }
+
+    let states = Arc::try_unwrap(shared).unwrap().states;
+
+    (states, answer)
 }
 
 fn main() {
     let start = std::time::Instant::now();
-    let solutions = solve::<15, 5>(100);
+    let (states, solutions) = solve::<15, 5>(140);
     let duration = start.elapsed().as_secs_f64();
 
-    let num_states = solutions.states.iter().map(|v| v.len()).sum::<usize>();
+    let num_states = states.len();
     println!("visited {} states in {:.2}s", num_states, duration);
     println!("bananas sold: {}", solutions.bananas_sold);
 
