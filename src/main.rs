@@ -8,11 +8,21 @@
 
 use std::hash::{BuildHasher, Hash};
 use std::iter::iter;
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use app_dirs2::{AppDataType, AppInfo};
 use dashmap::{DashMap, Entry};
 use fnv::FnvBuildHasher;
+
+mod ascii;
+mod asciicast;
+
+const APP_INFO: AppInfo = AppInfo {
+    name: "Cammy",
+    author: "Cammy"
+};
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 struct StateKey<const D: usize> {
@@ -109,30 +119,38 @@ impl<const D: usize> WorkerShared<D> {
 
 type Work<const D: usize> = Vec<State<D>>;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Answer<const D: usize> {
-    bananas_sold: u16,
+    x: u16,
+    held: u16,
     solutions: Vec<State<D>>,
 }
 
 impl<const D: usize> Answer<D> {
     fn insert(&mut self, state: &State<D>) {
-        if state.inner.x == (D - 1) as u16 {
-            if state.held > self.bananas_sold {
-                self.bananas_sold = state.held;
+        match Ord::cmp(&(state.inner.x, state.held), &(self.x, self.held)) {
+            std::cmp::Ordering::Greater => {
+                self.x = state.inner.x;
+                self.held = state.held;
                 self.solutions.clear();
                 self.solutions.push(*state);
-            } else if state.held == self.bananas_sold {
+            }
+            std::cmp::Ordering::Equal => {
                 self.solutions.push(*state);
             }
+            std::cmp::Ordering::Less => {}
         }
     }
 
     fn extend(&mut self, other: Self) {
-        if other.bananas_sold > self.bananas_sold {
-            *self = other;
-        } else if other.bananas_sold == self.bananas_sold {
-            self.solutions.extend(other.solutions);
+        match Ord::cmp(&(self.x, self.held), &(other.x, other.held)) {
+            std::cmp::Ordering::Less => {
+                *self = other;
+            }
+            std::cmp::Ordering::Equal => {
+                self.solutions.extend(other.solutions);
+            }
+            std::cmp::Ordering::Greater => {}
         }
     }
 }
@@ -234,6 +252,58 @@ fn build_workers<const D: usize>() -> (Vec<Worker<D>>, Receiver<Answer<D>>) {
     (workers, answer_receiver)
 }
 
+struct Path<'s, const D: usize> {
+    states: &'s DashMap<StateKey<D>, StateMeta<D>>,
+    key: Option<StateKey<D>>,
+}
+
+impl<'s, const D: usize> Iterator for Path<'_, D> {
+    type Item = State<D>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = self.key?;
+        let tmp = self.states.get(&key)?;
+        let meta = tmp.value();
+        let state = State {
+            inner: key,
+            held: meta.held,
+        };
+
+        self.key = meta.prev.map(|s| s.inner);
+        Some(state)
+    }
+}
+
+impl<'s, const D: usize> Path<'s, D> {
+    /// Render animated visualization and save to $TMP
+    fn render(self) -> std::io::Result<()> {
+        let mut path: Vec<_> = self.collect();
+        path.reverse();
+        let dir = app_dirs2::app_dir(AppDataType::UserData, &APP_INFO, "animations").unwrap();
+        std::fs::create_dir_all(&dir)?;
+
+        let mut timestamp = chrono::Utc::now().to_rfc3339();
+        if cfg!(windows) {
+            timestamp = timestamp.replace(":", "-");
+        }
+
+        let cast_filepath = dir.join(format!("cammy-{}.cast", timestamp));
+        let anim = ascii::render(&path);
+        println!("writing to {}", cast_filepath.display());
+        let mut file = std::fs::File::create(&cast_filepath)?;
+        anim.encode_to_asciicast_v2(&mut file)?;
+        
+        let gif_filepath = dir.join(format!("cammy-{}.gif", timestamp));
+        println!("writing to {}", gif_filepath.display());
+        Command::new("agg")
+            .arg(&cast_filepath)
+            .arg(&gif_filepath)
+            .output()?;
+
+        Ok(())
+    }
+}
+
 fn solve<const D: usize, const C: u16>(bananas: u16) -> (DashMap<StateKey<D>, StateMeta<D>>, Answer<D>) {
     let depth = bananas + 1;
 
@@ -281,18 +351,19 @@ fn solve<const D: usize, const C: u16>(bananas: u16) -> (DashMap<StateKey<D>, St
 
 fn main() {
     let start = std::time::Instant::now();
-    let (states, solutions) = solve::<10, 5>(170);
+    let (states, solutions) = solve::<10, 5>(100);
     let duration = start.elapsed().as_secs_f64();
 
     let num_states = states.len();
     println!("visited {} states in {:.2}s", num_states, duration);
-    println!("bananas sold: {}", solutions.bananas_sold);
 
-    if let Some(state) = solutions.solutions.first() {
-        println!("{:?}", state);
-    } else {
-        let farthest = states.iter().max_by_key(|r| r.key().x).unwrap();
-        println!("no solutions found. farthest reached: {}", farthest.key().x);
-        println!("{:?}, {:?}", farthest.key(), farthest.value());
-    }
+    println!("farthest reached: {}", solutions.x);
+    println!("bananas held: {}", solutions.held);
+
+    let solution = solutions.solutions.first();
+    let path = Path {
+        states: &states,
+        key: solution.map(|s| s.inner),
+    };
+    path.render().unwrap();
 }
