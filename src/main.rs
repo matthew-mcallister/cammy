@@ -282,10 +282,9 @@ impl<'s, const D: usize> Path<'s, D> {
         let dir = app_dirs2::app_dir(AppDataType::UserData, &APP_INFO, "animations").unwrap();
         std::fs::create_dir_all(&dir)?;
 
-        let mut timestamp = chrono::Utc::now().to_rfc3339();
-        if cfg!(windows) {
-            timestamp = timestamp.replace(":", "-");
-        }
+        let timestamp = chrono::Utc::now()
+            .to_rfc3339()
+            .replace(":", "-");
 
         let cast_filepath = dir.join(format!("cammy-{}.cast", timestamp));
         let anim = ascii::render(&path);
@@ -351,7 +350,7 @@ fn solve<const D: usize, const C: u16>(bananas: u16) -> (DashMap<StateKey<D>, St
 
 fn main() {
     let start = std::time::Instant::now();
-    let (states, solutions) = solve::<10, 5>(100);
+    let (states, solutions) = solve::<10, 5>(150);
     let duration = start.elapsed().as_secs_f64();
 
     let num_states = states.len();
